@@ -28,6 +28,15 @@ FP8_KV_CACHE_DATA_TYPE_AUTO = tl.constexpr(0)
 FP8_KV_CACHE_DATA_TYPE_FP8E4M3 = tl.constexpr(1)
 FP8_KV_CACHE_DATA_TYPE_FP8E5M2 = tl.constexpr(2)
 
+# Plain-int mirrors for the host side: ``int(tl.constexpr)`` is not traceable by
+# dynamo, and this wrapper runs inside the compiled/traced model graph.
+_KV_DTYPE_HOST = {
+    "auto": int(FP8_KV_CACHE_DATA_TYPE_AUTO.value),
+    "fp8": int(FP8_KV_CACHE_DATA_TYPE_FP8E4M3.value),
+    "fp8e4m3": int(FP8_KV_CACHE_DATA_TYPE_FP8E4M3.value),
+    "fp8e5m2": int(FP8_KV_CACHE_DATA_TYPE_FP8E5M2.value),
+}
+
 
 @libentry()
 @triton.jit
@@ -47,11 +56,17 @@ def concat_and_cache_mla_kernel(
     pe_dim,
     block_size,  # kv cache block size
     scale_ptr,
+    num_slots,  # in,  slot_mapping length (may be < num_tokens under graph padding)
     # data type
     kv_dtype: tl.constexpr,  # one of Fp8KVCacheDataType
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
+    # CUDA graph padding: the activations are padded up to the capture size
+    # while the step's slot_mapping only covers the real tokens.  Rows beyond
+    # the mapping carry padding and must not be cached.
+    if token_idx >= num_slots:
+        return
     slot_idx = tl.load(slot_mapping_ptr + token_idx)
 
     # Skip padded tokens
@@ -104,6 +119,23 @@ def concat_and_cache_mla_kernel(
         tl.store(dst_ptr, val, mask=mask)
 
 
+_slot_mismatch_reported = False
+
+
+def _report_slot_mismatch(num_slots: int, num_tokens: int) -> None:
+    """Log the first slot/token mismatch seen (shape-only, capture safe)."""
+    global _slot_mismatch_reported
+    if _slot_mismatch_reported or num_slots == num_tokens:
+        return
+    _slot_mismatch_reported = True
+    logger.warning(
+        "concat_and_cache_mla: slot_mapping (%s) != tokens (%s); rows beyond "
+        "the mapping are skipped (CUDA graph padding)",
+        num_slots,
+        num_tokens,
+    )
+
+
 class ConcatAndCacheMla(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -119,8 +151,24 @@ class ConcatAndCacheMla(torch.autograd.Function):
             kv_cache = kv_cache.squeeze(2)
         if kv_c.ndim != 2 or k_pe.ndim != 2 or kv_cache.ndim != 3:
             raise ValueError("MLA cache expects KV[N,D], RoPE[N,R] and paged [B,P,D+R]")
-        if k_pe.shape[0] != kv_c.shape[0] or slot_mapping.shape != (kv_c.shape[0],):
+        # The token count is defined by the KV inputs, matching the CUDA kernel
+        # (`num_tokens = kv_c.size(0)`).  `slot_mapping` need not match it:
+        #   * shorter -- CUDA graph padding: the activations are padded up to the
+        #     capture size while the step's mapping covers only the real tokens
+        #     ("MLA cache has fewer slots than tokens");
+        #   * longer  -- vLLM padded the attention metadata and filled the tail
+        #     with -1.
+        # Eager never pads, so requiring exact equality only broke graph mode
+        # (2026-10-26 Hy4-1022 TP32 graph).  The kernel handles both ends by
+        # skipping rows without a slot, so nothing here may change shapes:
+        # allocating inside a captured graph is what stalled the engine.
+        if k_pe.shape[0] != kv_c.shape[0]:
             raise ValueError("MLA cache inputs need one slot per token")
+        num_slots = slot_mapping.shape[0]
+        if num_slots != kv_c.shape[0] and not torch._dynamo.is_compiling():
+            # Logging is a graph break inside torch.compile / graph capture, so
+            # only report on the eager path.
+            _report_slot_mismatch(num_slots, kv_c.shape[0])
         if k_pe.dtype != kv_c.dtype or slot_mapping.dtype not in (
             torch.int32,
             torch.int64,
@@ -141,21 +189,16 @@ class ConcatAndCacheMla(torch.autograd.Function):
         if kv_cache_dtype == "auto" and kv_cache.dtype != kv_c.dtype:
             raise ValueError("For auto mode kv_cache must match input dtype")
 
-        # Map string dtype to internal constants
-        kv_dtype_map = {
-            "auto": FP8_KV_CACHE_DATA_TYPE_AUTO,
-            "fp8": FP8_KV_CACHE_DATA_TYPE_FP8E4M3,
-            "fp8e4m3": FP8_KV_CACHE_DATA_TYPE_FP8E4M3,
-            "fp8e5m2": FP8_KV_CACHE_DATA_TYPE_FP8E5M2,
-        }
-        kv_dtype = kv_dtype_map.get(kv_cache_dtype)
+        # Map string dtype to internal constants (plain ints: see _KV_DTYPE_HOST)
+        kv_dtype = _KV_DTYPE_HOST.get(kv_cache_dtype)
         if kv_dtype is None:
             raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype}")
-        kv_dtype = int(kv_dtype)  # tl.constexpr->int
 
         kv_lora_rank = kv_c.size(1)
         pe_dim = k_pe.size(1)
-        num_tokens = slot_mapping.size(0)
+        # Token count follows the KV inputs, like the CUDA kernel
+        # (`num_tokens = kv_c.size(0)`); rows without a slot are skipped.
+        num_tokens = kv_c.size(0)
 
         # make sure `scale` is a scalar tensor
         if scale.numel() != 1:
@@ -191,10 +234,48 @@ class ConcatAndCacheMla(torch.autograd.Function):
                 pe_dim,
                 kv_cache.size(1),  # kv cache block_size
                 scale,
+                num_slots,
                 kv_dtype=kv_dtype,
                 BLOCK_SIZE=BLOCK_SIZE,
             )
         return None
+
+
+def _concat_and_cache_mla_impl(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    scale: torch.Tensor,
+) -> None:
+    return ConcatAndCacheMla.apply(
+        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+    )
+
+
+# The Triton launch path is not traceable by dynamo: FlagGems' ``libentry.run``
+# does ``hasattr(arg, "__class__")`` on symbolic arguments and aborts the trace
+# ("Unsupported hasattr call").  This op runs inside the compiled model graph
+# (MLA KV-cache update is part of the model forward), so it must be opaque.
+try:
+    _concat_and_cache_mla_op = torch.library.custom_op(
+        "flaggems_vllm::concat_and_cache_mla", mutates_args={"kv_cache"}
+    )(_concat_and_cache_mla_impl)
+
+    @_concat_and_cache_mla_op.register_fake
+    def _(
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        scale: torch.Tensor,
+    ) -> None:
+        return None
+except Exception as _exc:  # noqa: BLE001 - old torch without custom_op
+    logger.debug("concat_and_cache_mla: custom_op unavailable (%s)", _exc)
+    _concat_and_cache_mla_op = None
 
 
 def concat_and_cache_mla(
@@ -205,7 +286,14 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
-    logger.debug("GEMS CONCAT_AND_CACHE_MLA")
-    return ConcatAndCacheMla.apply(
+    # ``logging`` calls are a graph break under torch.compile, and this op runs
+    # inside the captured model graph.
+    if not torch._dynamo.is_compiling():
+        logger.debug("GEMS CONCAT_AND_CACHE_MLA")
+    if _concat_and_cache_mla_op is None:
+        return _concat_and_cache_mla_impl(
+            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
+        )
+    return _concat_and_cache_mla_op(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )
