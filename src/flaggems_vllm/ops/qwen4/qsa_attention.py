@@ -12,6 +12,12 @@ from flaggems_vllm.ops.qwen4.qsa import _is_triton_device
 from flaggems_vllm.runtime import device as runtime_device
 
 _QSA_SPLIT_ALLOWED = (1, 2, 4, 8, 16, 32)
+# MACA's MACAMmaEncodingAttr::composeSharedLayoutForOperand asserts when the
+# MMA dot tile has M=8, which max(8, next_power_of_2(group_size)) produces at
+# TP8 (24/8 query heads over 2/8 = 1 KV head -> group_size = 3).  Keep the
+# default floor at 16; other vendors are unaffected in practice because their
+# group sizes already round up above 8.
+_QSA_MIN_BLOCK_M = 16
 
 
 def qsa_sparse_triton_launch_config(
@@ -510,7 +516,7 @@ def _qsa_sparse_paged_attention_split(
     softmax_scale: float | None,
     out: torch.Tensor,
     gate: torch.Tensor | None,
-    min_block_m: int = 8,
+    min_block_m: int = _QSA_MIN_BLOCK_M,
 ) -> torch.Tensor:
     """Run graph-safe split-TopK sparse attention with caller-owned partials."""
 
@@ -638,7 +644,7 @@ def _qsa_sparse_paged_attention(
     gate: torch.Tensor | None = None,
     split_workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     *,
-    min_block_m: int = 8,
+    min_block_m: int = _QSA_MIN_BLOCK_M,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches.
 
