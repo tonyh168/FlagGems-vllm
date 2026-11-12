@@ -2120,6 +2120,58 @@ def invoke_fused_moe_triton_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    # Thead sparse sorted down projection; preserve the generic implementation
+    # for prefill, GEMM1, quantized/biased/fused/naive or unsupported layouts.
+    if (
+        device.vendor_name == "thead"
+        and compute_type == tl.bfloat16
+        and mul_routed_weight
+        and top_k == 1
+        and not any(
+            (
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                per_channel_quant,
+                FUSE_SILU,
+                direct_sum,
+            )
+        )
+        and A_scale is None
+        and B_scale is None
+        and B_bias is None
+        and block_shape is None
+        and out_top_k == 1
+        and not config.get("PAIR_GATE_UP_DOT", False)
+    ):
+        from flaggems_vllm.runtime.backend._thead.ops.moe_down_mma import (
+            moe_down_mma_out,
+            supports_moe_down_mma,
+        )
+
+        if supports_moe_down_mma(
+            A,
+            B,
+            C,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            config,
+        ):
+            moe_down_mma_out(
+                A,
+                B,
+                C,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                config,
+            )
+            return
+
     M = A.size(0)
     num_tokens = M * top_k
     if sorted_token_ids is not None:

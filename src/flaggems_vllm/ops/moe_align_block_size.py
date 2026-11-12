@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
 
 if has_triton_tle(3, 6, 0):
@@ -619,9 +620,12 @@ def moe_align_block_size_triton(
     block_expert_tle = triton.next_power_of_2(num_experts)
 
     # Query the current compiler target at dispatch; older TLE versions fall back.
+    # PPU exposes a CUDA-compatible device, but its compiler rejects
+    # tle.distributed_barrier, so skip the TLE path for thead.
     is_tle_supported = getattr(tle_api, "is_tle_supported", None)
     if (
         HAS_TLE
+        and runtime.device.vendor_name != "thead"
         and topk_ids.is_cuda
         and block_expert_tle <= 1024
         and callable(is_tle_supported)
