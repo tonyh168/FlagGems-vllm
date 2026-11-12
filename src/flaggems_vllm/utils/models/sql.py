@@ -80,10 +80,14 @@ class SQLPersistantModel(PersistantModel):
         name: str,
         engine: sqlalchemy.engine.Engine,
     ) -> Optional[Type[Base]]:
+        # A cache miss must not reflect every unrelated tuning table. Do not
+        # cache absence: another worker can create this table after this call.
+        if not sqlalchemy.inspect(engine).has_table(name):
+            return None
         AutoBase: sqlalchemy.ext.automap.AutomapBase = (
             sqlalchemy.ext.automap.automap_base()
         )
-        AutoBase.prepare(engine)
+        AutoBase.prepare(autoload_with=engine, reflection_options={"only": [name]})
         ModelCls: Optional[Type[Base]] = AutoBase.classes.get(name)
         return ModelCls
 
