@@ -852,7 +852,7 @@ def _masked_single_group_kernel(
 
 
 def _validate_padding(scores, bias, is_padding, n_group, topk_group, topk):
-    if runtime.device.vendor_name != "nvidia" or scores.device.type != "cuda":
+    if runtime.device.vendor_name not in ("nvidia", "metax", "iluvatar") or scores.device.type != "cuda":
         raise NotImplementedError("grouped_topk padding requires NVIDIA CUDA")
     rows, experts = scores.shape
     if (
