@@ -27,6 +27,13 @@ if has_triton_tle(3, 6, 0):
         import triton.experimental.tle.language as tle
 
         HAS_TLE_FLASHMLA_SPARSE = supports_sparse_mla_tle(tle)
+        from flaggems_vllm import runtime
+
+        if runtime.device.vendor_name == "iluvatar":
+            # Iluvatar's TLE exposes the sparse-MLA API surface but rejects
+            # nv_mma_shared_layout=True ("TLE alloc does not support ..."), so
+            # use the plain Triton kernel instead.
+            HAS_TLE_FLASHMLA_SPARSE = False
     except ImportError:
         tle = None
         HAS_TLE_FLASHMLA_SPARSE = False
