@@ -259,7 +259,12 @@ def _preprocess_kv_cache(kv_cache, block_tables, context_lens, total_rows, next_
     else:
         block_tables_expanded = block_tables.contiguous().to(torch.int32)
 
-    max_ctx = int(context_lens.max().item())
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        # CUDA graph capture must not synchronize the host.  Use the allocated
+        # block-table width as a static upper bound for the grid.
+        max_ctx = block_tables_expanded.shape[1] * block_size
+    else:
+        max_ctx = int(context_lens.max().item())
 
     return kv_data, kv_scales, block_tables_expanded, max_ctx
 
